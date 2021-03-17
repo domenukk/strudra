@@ -2,6 +2,7 @@
 
 Welcome to Strudra, a way to craft Ghidra structs in python, using `ghidra_bridge`.
 
+## Example
 ```python
 import strudra
 sd = strudra.Strudra()
@@ -16,3 +17,12 @@ assert (test_struct.test == test_struct[0x0])
 test_struct.test2 = [0x42, 0x42]
 # At the end, we can get the bytes value back
 bytes(test_struct)
+```
+
+## How studra works
+
+Strudra loads all structs from the Ghidra 
+For this to work, you have to setup `ghidra_bridge` in Ghidra: https://github.com/justfoxing/ghidra_bridge/
+
+Then, you can create instances of these structs, set values in these structs, and edit them.
+Good if you want to interact with your target.

@@ -14,7 +14,7 @@ bytes(test_struct)
 ```
 """
 import struct
-from typing import Union, Dict, Optional, List, cast, Any, Type, Tuple
+from typing import Union, Dict, Optional, List, cast, Any, Type, Tuple, Set
 
 import ghidra_bridge
 
@@ -255,6 +255,8 @@ class AbStrud:
             self.all_struds: Optional[Dict[str, Type[AbStrud]]] = None
 
         self._length = length
+        # Cache for embedded structs, they proxy all state anyway, so we may reuse them.
+        self._embed_cache: Set[AbStrud] = set()
 
         if nested_at is not None:
             self.nested_at: Optional[Tuple[AbStrud, int]] = nested_at
@@ -322,11 +324,16 @@ class AbStrud:
         :return: the bytes at name or offset with the element's len (Use `.find_member()` to get a Member instance).
         """
         member = self.find_member(name_or_offset)
-        return member.get_repr(
+        if member in self._embed_cache:
+            return member
+        ret = member.get_repr(
             bytes(self)[member.offset : member.offset + len(member)],
             parent=self,
             all_struds=self.all_struds,
         )
+        if isinstance(ret, AbStrud):
+            self._embed_cache.add(ret)
+        return ret
 
     def __setitem__(
         self, name_or_offset: Union[str, int], value: Union[bytes, int, float]

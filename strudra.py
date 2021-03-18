@@ -7,14 +7,14 @@ Usage:
 import strudra
 sd = strudra.Strudra()
 sd.add_struct("struct test{ int test1; char test2[2]; };")
-test_struct = sd["test"](test1=0x1337)
+test_struct = sd.test(test1=0x1337)
 assert (test_struct.test == test_struct[0x0])
 test_struct.test2 = [0x42, 0x42]
 bytes(test_struct)
 ```
 """
 import struct
-from typing import Union, Dict, Optional, List, cast
+from typing import Union, Dict, Optional, List, cast, Any
 
 import ghidra_bridge
 
@@ -113,6 +113,9 @@ class Member:
         :param val: the value that should be bytified
         :return: the bytified values, as bytes
         """
+        if isinstance(val, AbStrud):
+            # In case we want to set an embedded Strud, use the serialized notation directly.
+            val = val.serialized
         if isinstance(val, str):
             # in case we want to set a char using chr(..) which results in a string
             val = val.encode()
@@ -185,10 +188,34 @@ class AbStrud:
     """
 
     # This gets replaced with the actual impl later.
-    def __init__(self, str_repr: str, members: List[Member], length: int, **kwargs):
-        self.str_repr = str_repr  # type: str
-        self.members = members  # type: List[Member]
-        self.serialized = bytearray(length)  # type: bytearray
+    def __init__(
+        self,
+        str_repr: str,
+        members: List[Member],
+        length: int,
+        from_bytes=None,
+        **kwargs,
+    ):
+        """
+        Creates a new Abstract Strudra Object.
+        This function will be wrapped for each actual Strudra subclass/Strud.
+        :param str_repr: The string representation of a struct, from Ghidra
+        :param members: The (parsed) members of this Strud
+        :param length: The length of this Strud
+
+        :param from_bytes: (optional) a parameter indicating the initial bytes for this Strud
+        :param kwargs: specifies optional data for the Strud
+        """
+        self.str_repr: str = str_repr
+        self.members: List[members] = members
+        if from_bytes is not None:
+            if len(from_bytes) != length:
+                raise ValueError(
+                    f"Illegal value in from_bytes: Expected {length} bytes but got {len(from_bytes)}"
+                )
+            self.serialized: bytearray = bytearray(from_bytes)
+        else:
+            self.serialized: bytearray = bytearray(length)
         for key, val in kwargs.items():
             self[key] = val
 
@@ -367,7 +394,7 @@ def parse_struct_members(is_big_endian: bool, struct_str: str) -> List[Member]:
     offset = -1  # type: int
     typename = ""  # type: str
 
-    print("Parsing", struct_str)
+    # print("Parsing", struct_str)
     vals = struct_str.split("{", 1)[1].rsplit("}", 1)[0].split("   ")
     for val in vals:
         if state == 0:
@@ -423,6 +450,10 @@ class MemberValueWrapper:
         self.member = member
 
     def __get__(self, instance: AbStrud, owner) -> supported_types:
+        if instance is None:
+            raise ValueError(
+                "You are using a Strud class, not an instance! Call class() to get a fresh instance."
+            )
         return instance[self.member.offset]
 
     def __set__(self, instance: AbStrud, value: supported_types) -> None:
@@ -459,17 +490,20 @@ def define_struct(
 
     members = filled_members
 
-    def new_init(self, **kwargs):
+    def new_init(self, from_bytes=None, **kwargs):
         f"""
-        Create a new {name} struct
+        Create a new {name} strud
+        {str_repr}
         :param self: the new object
+        :param from_bytes: (optional) a parameter indicating the initial bytes for this Strud
         :param kwargs: Keys and Values of members to set them immediately
         """
-        old_init(self, str_repr, members, length, **kwargs)
+        old_init(self, str_repr, members, length, from_bytes, **kwargs)
 
-    struct_dict["name"] = name
+    # We want to give the user the option to still have a struct member called `name`
+    struct_dict["_name"] = name
     struct_dict["__init__"] = new_init
-    struct_dict["__doc__"] = new_init
+    struct_dict["__doc__"] = f"A {name} Strud class for:\n{str_repr}"
 
     for member in members:
         # Add getter and setter for Members by name.
@@ -555,25 +589,39 @@ class Strudra:
     """
 
     def __init__(self, bridge: ghidra_bridge.GhidraBridge = None):
-        """
+        f"""
         Create a new Strudra instance
+        {__doc__}
+
         :param bridge: (optional) the ghidra bridge, else connects to localhost
         """
-        self.bridge = bridge if bridge else gh_bridge()
-        self.struds = load_struds(self.bridge)
-        self.is_big_endian = target_is_big_endian(self.bridge)
+        self.bridge: ghidra_bridge.GhidraBridge = bridge if bridge else gh_bridge()
+        self.is_big_endian: bool = target_is_big_endian(self.bridge)
+        dict_orig = self.__dict__.copy()
+        # Make sure it's still there after the first reload...
+        dict_orig["_dict_orig"] = dict_orig
+        self._dict_orig: Dict[str, Any] = dict_orig
+        self._dict_orig["_dict_orig"] = self._dict_orig
 
-    def __dir__(self):
-        return dir(self.struds)
+        self.struds: Dict[str, AbStrud] = {}
+        self.reload()
 
-    def __getitem__(self, item):
+    def __dir__(self) -> List[str]:
+        return list(self.__dict__.keys()) + list(self.struds.keys())
+
+    def __getitem__(self, item) -> Any:
         return self.struds.__getitem__(item)
 
-    def reload(self):
+    def reload(self) -> None:
         """
         Reload the structs from ghidra
         """
+        self.__dict__ = self._dict_orig
         self.struds = load_struds(self.bridge)
+        for name, strud in self.struds.items():
+            if name not in self.__dict__:
+                # Make struds easily accessible
+                self.__setattr__(name, strud)
 
     def add_struct(self, cstruct: str) -> AbStrud:
         """

@@ -14,13 +14,15 @@ bytes(test_struct)
 ```
 """
 import struct
-from typing import Union, Dict, Optional, List, cast, Any
+from typing import Union, Dict, Optional, List, cast, Any, Type, Tuple
 
 import ghidra_bridge
 
-supported_types = Union[bytes, int, float, List[int], List[float]]
+SupportedTypes: Union = Union[
+    bytes, int, float, "AbStrud", List[int], List[float], List["AbStrud"]
+]
 
-_big_endian_cache = {}
+_big_endian_cache: Dict[ghidra_bridge.GhidraBridge, bool] = {}
 
 
 def get_fmt(typename: str, typelen: int) -> str:
@@ -93,13 +95,16 @@ class Member:
         self.name: str = name if name else f"field_{hex(offset)}"
         self.comment: Optional[str] = comment
 
+        # for arrays, we get the element type
+        self.el_typename: str = typename.split("[")[0]
+
         endianness = ">" if big_endian else "<"
         self.fmt = f"{endianness}{get_fmt(typename, length)}"
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.length
 
-    def to_bytes(self, val: supported_types):
+    def to_bytes(self, val: SupportedTypes) -> bytes:
         """
         Get the bytes for the given val.
         If it's a bytes or bytearray object, it will return the bytes, padded with 0s.
@@ -141,7 +146,7 @@ class Member:
         return struct.pack(self.fmt, val)
 
     @property
-    def el_count(self):
+    def el_count(self) -> int:
         """
         The amount of elements, in case of an array
         :return: the amount of elements
@@ -150,7 +155,7 @@ class Member:
         return len(self.fmt) - 1
 
     @property
-    def is_array(self):
+    def is_array(self) -> bool:
         """
         Returns if this type is an array
         :return: true if array
@@ -158,23 +163,51 @@ class Member:
         # We return if fmt is more than endiannes + single type, no extra field needed.
         return len(self.fmt) > 2
 
-    def get_repr(self, val: bytes) -> supported_types:
+    @property
+    def el_len(self) -> int:
         """
-        Get the bytewise representation
-        :param val:
-        :return:
+        Gets the length of each element
+        :return: the length of each element
+        """
+        return int(len(self) / self.el_count)
+
+    def get_repr(
+        self,
+        val: bytes,
+        parent: "AbStrud" = None,
+        all_struds: Dict[str, Type["AbStrud"]] = None,
+    ) -> SupportedTypes:
+        """
+        Get the unpacked representation
+        :param val: The stringified value
+        :param parent: The enclosing struct, for nesting
+        :param all_struds: a list of loaded struds. If the typename is found here, this will return the corret Strud
+        :return: The respective type
         """
         if len(val) != len(self):
             raise ValueError(
                 f"Could not get representation for value:"
                 f"Expected bytes of len({len(self)}) but got {len(val)}: {val}"
             )
-        unpacked = struct.unpack(self.fmt, val)
+        if all_struds and self.el_typename in all_struds:
+            # We found a nested Strud! Return Strud value.
+            ret_strud_cls = all_struds[self.el_typename]
+            el_len = self.el_len
+            if self.is_array:
+                return [
+                    ret_strud_cls(nested_at=(parent, self.offset + i * el_len))
+                    for i in range(self.el_count)
+                ]
+            else:
+                return ret_strud_cls(nested_at=(parent, self.offset))
+
+        else:
+            unpacked = struct.unpack(self.fmt, val)
         if self.is_array:
             return list(unpacked)
         return unpacked[0]
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         endian_str = "be" if self.big_endian else "le"
         name_str = f" name: {self.name}" if self.name else ""
         comment_str = f" comment: {self.comment}" if self.comment else ""
@@ -190,37 +223,66 @@ class AbStrud:
     # This gets replaced with the actual impl later.
     def __init__(
         self,
-        str_repr: str,
-        members: List[Member],
-        length: int,
-        from_bytes=None,
+        from_bytes: Optional[bytes] = None,
+        nested_at: Optional[Tuple["AbStrud", int]] = None,
         **kwargs,
     ):
         """
         Creates a new Abstract Strudra Object.
-        This function will be wrapped for each actual Strudra subclass/Strud.
-        :param str_repr: The string representation of a struct, from Ghidra
-        :param members: The (parsed) members of this Strud
-        :param length: The length of this Strud
 
         :param from_bytes: (optional) a parameter indicating the initial bytes for this Strud
+        :param nested_at: (optional) If set, all operations on this struct will be proxied to the enclosing struct.
         :param kwargs: specifies optional data for the Strud
         """
-        self.str_repr: str = str_repr
-        self.members: List[members] = members
+        # We pass the following params inside kwargs as to not confuse the IDEs
+        # str_repr: The string representation of a struct, from Ghidra
+        # The (parsed) members of this Strud
+        # The length of this Strud
+        if nested_at and not len(nested_at) == 2:
+            raise ValueError("Nested_at needs to be a tuple of (Strud, offset)")
+
+        self.str_repr: str = kwargs.pop("_str_repr")
+        if not self.str_repr:
+            raise ValueError("Attempted to instantiate uninitialized AbStrud")
+        length = kwargs.pop("_length")
+        self.members: List[Member] = kwargs.pop("_members")
+        if "_all_struds" in kwargs:
+            # print("struds", kwargs["_all_struds"])
+            self.all_struds: Optional[Dict[str, Type[AbStrud]]] = kwargs.pop(
+                "_all_struds"
+            )
+        else:
+            self.all_struds: Optional[Dict[str, Type[AbStrud]]] = None
+
+        self._length = length
+
+        if nested_at is not None:
+            self.nested_at: Optional[Tuple[AbStrud, int]] = nested_at
+            self._serialized: Optional[bytearray] = None
+        else:
+            self.nested_at: Optional[Tuple[AbStrud, int]] = None
+            self._serialized: Optional[bytearray] = bytearray(length)
+
         if from_bytes is not None:
             if len(from_bytes) != length:
                 raise ValueError(
                     f"Illegal value in from_bytes: Expected {length} bytes but got {len(from_bytes)}"
                 )
-            self.serialized: bytearray = bytearray(from_bytes)
-        else:
-            self.serialized: bytearray = bytearray(length)
+            self.setbytes(0, from_bytes)
         for key, val in kwargs.items():
             self[key] = val
 
-    def __len__(self):
-        return len(self.serialized)
+    def __len__(self) -> int:
+        return self._length
+
+    @property
+    def serialized(self) -> bytes:
+        if self.nested_at:
+            return self.nested_at[0].serialized[
+                self.nested_at[1] : self.nested_at[1] + len(self)
+            ]
+        else:
+            return bytes(self._serialized)
 
     def setbytes(self, offset: int, b: bytes) -> None:
         """
@@ -228,8 +290,11 @@ class AbStrud:
         :param offset: the offset to start writing at
         :param b: the bytes to write
         """
-        for i, byte in enumerate(b):
-            self.serialized[i + offset] = byte
+        if self.nested_at:
+            self.nested_at[0].setbytes(self.nested_at[1] + offset, b)
+        else:
+            for i, byte in enumerate(b):
+                self._serialized[i + offset] = byte
 
     def find_member(self, name_or_offset: Union[str, int]) -> Member:
         """
@@ -247,7 +312,7 @@ class AbStrud:
                     return member
         raise ValueError(
             f"Could not find struct member with name or offset '{name_or_offset}' "
-            f"(you may use `setbytes(..)` to write at a mem location directly)."
+            f"(you may use `setbytes(..)` to write at a mem location directly or bytes() to read values)."
         )
 
     def __getitem__(self, name_or_offset: Union[str, int]) -> Union[bytes, int, float]:
@@ -258,7 +323,9 @@ class AbStrud:
         """
         member = self.find_member(name_or_offset)
         return member.get_repr(
-            self.serialized[member.offset : member.offset + len(member)]
+            bytes(self)[member.offset : member.offset + len(member)],
+            parent=self,
+            all_struds=self.all_struds,
         )
 
     def __setitem__(
@@ -272,15 +339,27 @@ class AbStrud:
         member = self.find_member(name_or_offset)
         self.setbytes(member.offset, member.to_bytes(value))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         # return f"{self.str_repr}, bytes: {self.serialized}"
         return (
             f"Strud {self.__class__.__name__}<len: {len(self)} "
-            f"{[repr(x) + '=' + str(self[x.offset]) for x in self.members]}, bytes: {self.serialized}>"
+            f"{[chr(10) + repr(x) + ' = ' + str(self[x.offset]) for x in self.members]}\n>"
         )
 
-    def __bytes__(self):
-        return bytes(self.serialized)
+    def __bytes__(self) -> bytes:
+        if self.nested_at:
+            return bytes(self.nested_at[0])[
+                self.nested_at[1] : self.nested_at[1] + len(self)
+            ]
+        else:
+            return bytes(self._serialized)
+
+    def bytes(self) -> bytes:
+        """
+        Return the serialized bytes
+        :return: The bytes
+        """
+        return bytes(self)
 
     def to_cstruct_str(self) -> str:
         """
@@ -298,13 +377,33 @@ class AbStrud:
         cstruct += "\n};"
         return cstruct
 
+    def clone(self) -> "AbStrud":
+        """
+        Return a clone
+        :return: a fresh instance of this element, with the same values set
+        """
+        return self.__class__(bytes(self))
 
-def parse_to_strud(b: ghidra_bridge.GhidraBridge, cstruct: str) -> AbStrud:
+    @property
+    def is_nested(self) -> bool:
+        """
+        A nested Strud changes the state of an enclosing strud
+        :return: True if nested
+        """
+        return self.nested_at is not None
+
+
+def parse_to_strud(
+    b: ghidra_bridge.GhidraBridge,
+    cstruct: str,
+    all_struds: Optional[Dict[str, Type[AbStrud]]] = None,
+) -> Type[AbStrud]:
     """
     Creates a Strud from a given C struct.
     Unlike `add_struct` the parsed cstruct won't be added to Ghidras DB.
     :param b: the Ghidra instance
     :param cstruct: the (c-)struct to parse
+    :param all_struds: (optional) Reference to all struds, for nested types
     :return: The Strud
     """
     cstruct.replace("'''", '"""')
@@ -322,14 +421,20 @@ def parse_to_strud(b: ghidra_bridge.GhidraBridge, cstruct: str) -> AbStrud:
         parsed_struct.getName(),
         parsed_struct.getLength(),
         parsed_struct.toString(),
+        all_struds,
     )
 
 
-def add_struct(b: ghidra_bridge.GhidraBridge, cstruct: str) -> AbStrud:
+def add_struct(
+    b: ghidra_bridge.GhidraBridge,
+    cstruct: str,
+    all_struds: Optional[Dict[str, Type[AbStrud]]] = None,
+) -> Type[AbStrud]:
     """
     Parses and adds a (c)-Struct to ghidras Database
     :param b: the ghidra bridge instance
     :param cstruct: the new struct to parse
+    :param all_struds: (optional) Reference to all struds, for nested types
     :return: the added and parsed struct object
     """
     # Keep if you use triple quotes in a struct definition, you're out of luck anyway...
@@ -367,6 +472,7 @@ def add_struct(b: ghidra_bridge.GhidraBridge, cstruct: str) -> AbStrud:
         new_struct.getName(),
         new_struct.getLength(),
         new_struct.toString(),
+        all_struds,
     )
 
 
@@ -449,28 +555,34 @@ class MemberValueWrapper:
     def __init__(self, member: Member):
         self.member = member
 
-    def __get__(self, instance: AbStrud, owner) -> supported_types:
+    def __get__(self, instance: AbStrud, owner) -> SupportedTypes:
         if instance is None:
             raise ValueError(
                 "You are using a Strud class, not an instance! Call class() to get a fresh instance."
             )
         return instance[self.member.offset]
 
-    def __set__(self, instance: AbStrud, value: supported_types) -> None:
+    def __set__(self, instance: AbStrud, value: SupportedTypes) -> None:
         instance[self.member.offset] = value
 
 
 def define_struct(
-    is_big_endian: bool, name: str, length: int, str_repr: str, members: List[Member]
-) -> AbStrud:
+    is_big_endian: bool,
+    name: str,
+    length: int,
+    str_repr: str,
+    members: List[Member],
+    all_struds: Dict[str, Type[AbStrud]] = None,
+) -> Type[AbStrud]:
     """
     Define an new Strud object
-    :param is_big_endian:
-    :param name:
-    :param length:
-    :param str_repr:
-    :param members:
-    :return:
+    :param is_big_endian: If this is a big endian strud
+    :param name: the name of this strud
+    :param length: the length
+    :param str_repr: Ghidra toString() repr
+    :param members: the parsed members for this strud
+    :param all_struds: Reference to the list of all strud types, for embedded struct handling
+    :return: The new Strud type
     """
     struct_dict = AbStrud.__dict__.copy()
     old_init = struct_dict["__init__"]
@@ -490,15 +602,30 @@ def define_struct(
 
     members = filled_members
 
-    def new_init(self, from_bytes=None, **kwargs):
+    def new_init(
+        self,
+        from_bytes: Optional[bytes] = None,
+        nested_at: Optional[Tuple[AbStrud, int]] = None,
+        **kwargs,
+    ):
         f"""
         Create a new {name} strud
         {str_repr}
         :param self: the new object
         :param from_bytes: (optional) a parameter indicating the initial bytes for this Strud
+        :param nested_at: (optional) If set to a tuple of (Strud, offset), will propagate changes to the outer Strud.
         :param kwargs: Keys and Values of members to set them immediately
         """
-        old_init(self, str_repr, members, length, from_bytes, **kwargs)
+        old_init(
+            self,
+            from_bytes,
+            nested_at,
+            _str_repr=str_repr,
+            _members=members,
+            _length=length,
+            _all_struds=all_struds,
+            **kwargs,
+        )
 
     # We want to give the user the option to still have a struct member called `name`
     struct_dict["_name"] = name
@@ -515,7 +642,7 @@ def define_struct(
             struct_dict[member.name] = prop
 
     return cast(
-        AbStrud,
+        Type[AbStrud],
         type(
             name,
             (AbStrud,),
@@ -525,14 +652,19 @@ def define_struct(
 
 
 def ghidra_struct_to_strud(
-    is_big_endian: bool, name: str, length: int, string_repr: str
-) -> AbStrud:
+    is_big_endian: bool,
+    name: str,
+    length: int,
+    string_repr: str,
+    all_struds: Optional[Dict[str, Type[AbStrud]]] = None,
+) -> Type[AbStrud]:
     """
     Make an strudra internal struct out of a ghidra struct
     :param is_big_endian: Endianness of this struct
     :param name: The name of this struct
     :param length: The length of this struct
     :param string_repr: The stringified representation of this struct
+    :param all_struds: (optional) The list of all struds, for nested struct handling
     :return: The parsed strud
     """
     return define_struct(
@@ -541,10 +673,11 @@ def ghidra_struct_to_strud(
         length,
         string_repr,
         parse_struct_members(is_big_endian, string_repr),
+        all_struds,
     )
 
 
-def load_struds(b: ghidra_bridge.GhidraBridge) -> Dict[str, AbStrud]:
+def load_struds(b: ghidra_bridge.GhidraBridge) -> Dict[str, Type[AbStrud]]:
     """
     Get all structures. This uses toString on the Ghidra side and parses it.
     All other/saner ways to do it turned out to be way too slow.
@@ -552,18 +685,20 @@ def load_struds(b: ghidra_bridge.GhidraBridge) -> Dict[str, AbStrud]:
     :return: all structs, loaded from Ghidra
     """
     is_big_endian = target_is_big_endian(b)
+    all_struds = {}
     # x.length
     # This is too slow (3 seconds vs 37ms), let's parse it instead.
     # return b.remote_eval("{x.getName(): (x, x.length, [(c.fieldName, c.offset, c.endOffset,
     # c.isFlexibleArrayComponent()) for c in x.components])
     # for x in currentProgram.getDataTypeManager().getAllStructures()}")
-    return {
-        x[0]: ghidra_struct_to_strud(is_big_endian, x[0], x[1], x[2])
-        for x in b.remote_eval(
-            "[(x.getName(), x.getLength(), x.toString())"
-            "for x in currentProgram.getDataTypeManager().getAllStructures()]"
+    for x in b.remote_eval(
+        "[(x.getName(), x.getLength(), x.toString())"
+        "for x in currentProgram.getDataTypeManager().getAllStructures()]"
+    ):
+        all_struds[x[0]] = ghidra_struct_to_strud(
+            is_big_endian, x[0], x[1], x[2], all_struds
         )
-    }
+    return all_struds
 
 
 def gh_bridge(
@@ -603,7 +738,7 @@ class Strudra:
         self._dict_orig: Dict[str, Any] = dict_orig
         self._dict_orig["_dict_orig"] = self._dict_orig
 
-        self.struds: Dict[str, AbStrud] = {}
+        self.struds: Dict[str, Type[AbStrud]] = {}
         self.reload()
 
     def __dir__(self) -> List[str]:
@@ -623,7 +758,7 @@ class Strudra:
                 # Make struds easily accessible
                 self.__setattr__(name, strud)
 
-    def add_struct(self, cstruct: str) -> AbStrud:
+    def add_struct(self, cstruct: str) -> Type[AbStrud]:
         """
         Add a c struct to ghidra
         :param cstruct:
@@ -633,7 +768,7 @@ class Strudra:
         self.reload()
         return ret
 
-    def parse_struct(self, cstruct: str) -> AbStrud:
+    def parse_struct(self, cstruct: str) -> Type[AbStrud]:
         """
         Parse C Struct using Ghidra, but don't add it to the internal data store
         :param cstruct: the struct to parse

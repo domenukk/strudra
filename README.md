@@ -16,7 +16,7 @@ sd.add_struct("struct test{ int test1; char test2[2]; };")
 Now, we can access the new `test` struct from ghidra.
 We can alread set values in the constructor
 ```python
-test_struct = sd["test"](test1=0x1337)
+test_struct = sd.test(test1=0x1337)
 ```
 ### We can use struct members by name or by offset
 ```python

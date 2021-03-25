@@ -4,8 +4,11 @@ Welcome to Strudra, a way to craft Ghidra structs in python, using `ghidra_bridg
 
 ## Example
 First, init Strudra - you can pass in a custom Ghidra Bridge here, if you like.
+
 ```python
-import strudra
+
+from strudra import strudra
+
 sd = strudra.Strudra()
 ```
 We can use _all_ structs from Ghidra, but let's add one just for this example.

@@ -13,7 +13,9 @@ test_struct.test2 = [0x42, 0x42]
 bytes(test_struct)
 ```
 """
+import json
 import struct
+from datetime import datetime
 from typing import Union, Dict, Optional, List, cast, Any, Type, Tuple, Set
 
 import ghidra_bridge
@@ -119,7 +121,7 @@ class Member:
         :return: the bytified values, as bytes
         """
         if isinstance(val, AbStrud):
-            # In case we want to set an embedded Strud, use the serialized notation directly.
+            # In case we want to set an nestedded Strud, use the serialized notation directly.
             val = val.serialized
         if isinstance(val, str):
             # in case we want to set a char using chr(..) which results in a string
@@ -255,8 +257,8 @@ class AbStrud:
             self.all_struds: Optional[Dict[str, Type[AbStrud]]] = None
 
         self._length = length
-        # Cache for embedded structs, they proxy all state anyway, so we may reuse them.
-        self._embed_cache: Set[AbStrud] = set()
+        # Cache for nestedded structs, they proxy all state anyway, so we may reuse them.
+        self._nested_cache: Set[AbStrud] = set()
 
         if nested_at is not None:
             self.nested_at: Optional[Tuple[AbStrud, int]] = nested_at
@@ -324,7 +326,7 @@ class AbStrud:
         :return: the bytes at name or offset with the element's len (Use `.find_member()` to get a Member instance).
         """
         member = self.find_member(name_or_offset)
-        if member in self._embed_cache:
+        if member in self._nested_cache:
             return member
         ret = member.get_repr(
             bytes(self)[member.offset : member.offset + len(member)],
@@ -332,7 +334,7 @@ class AbStrud:
             all_struds=self.all_struds,
         )
         if isinstance(ret, AbStrud):
-            self._embed_cache.add(ret)
+            self._nested_cache.add(ret)
         return ret
 
     def __setitem__(
@@ -348,9 +350,15 @@ class AbStrud:
 
     def __repr__(self) -> str:
         # return f"{self.str_repr}, bytes: {self.serialized}"
+
+        nl = "\n\t"
+
+        def member_repr(member):
+            return f"{hex(member.offset)}: ({member.typename}) {member.name} = {self[member.offset]}"
+
         return (
-            f"Strud {self.__class__.__name__}<len: {len(self)} "
-            f"{[chr(10) + repr(x) + ' = ' + str(self[x.offset]) for x in self.members]}\n>"
+            f"Strud {self.__class__.__name__}<members: {len(self.members)}, len: {len(self)}, named: {{\n\t"
+            f"{nl.join([member_repr(x) for x in self.members if not x.name.startswith('field_')])}\n}}>"
         )
 
     def __bytes__(self) -> bytes:
@@ -588,7 +596,7 @@ def define_struct(
     :param length: the length
     :param str_repr: Ghidra toString() repr
     :param members: the parsed members for this strud
-    :param all_struds: Reference to the list of all strud types, for embedded struct handling
+    :param all_struds: Reference to the list of all strud types, for nestedded struct handling
     :return: The new Strud type
     """
     struct_dict = AbStrud.__dict__.copy()
@@ -684,7 +692,24 @@ def ghidra_struct_to_strud(
     )
 
 
-def load_struds(b: ghidra_bridge.GhidraBridge) -> Dict[str, Type[AbStrud]]:
+def serialize_struds(data: Any, filename: str):
+    """Save Data to file"""
+    with open(filename, "w") as fp:
+        json.dump(data, fp)
+
+
+def data_from_file(
+    filename: str,
+) -> Dict[str, Union[str, bool, List[Dict[str, Union[str, int]]]]]:
+    """Load Struds data from a file
+    :returns a dict of struds, bigEndian, the name"""
+    with open(filename, "r") as f:
+        return json.load(f)
+
+
+def data_from_ghidra(
+    b: ghidra_bridge.GhidraBridge,
+) -> Dict[str, Union[str, bool, List[Dict[str, Union[str, int]]]]]:
     """
     Get all structures. This uses toString on the Ghidra side and parses it.
     All other/saner ways to do it turned out to be way too slow.
@@ -692,20 +717,45 @@ def load_struds(b: ghidra_bridge.GhidraBridge) -> Dict[str, Type[AbStrud]]:
     :return: all structs, loaded from Ghidra
     """
     is_big_endian = target_is_big_endian(b)
+    # x.length
+    # This is too slow (3 seconds vs 37ms), let's parse it instead.
+    # return b.remote_eval("{x.getName(): (x, x.length, [(c.fieldName, c.offset, c.endOffset,
+    # c.isFlexibleArrayComponent()) for c in x.components])
+    # for x in currentProgram.getDataTypeManager().getAllStructures()}")
+    ghidra_structs = b.remote_eval(
+        "[{'name': x.getName(), 'length': x.getLength(), 'ghidra': x.toString()}"
+        "for x in currentProgram.getDataTypeManager().getAllStructures()]"
+    )
+
+    data = {
+        "name": b.get_flat_api().currentProgram.name,
+        "timestamp": datetime.now().isoformat(),
+        "big_endian": is_big_endian,
+        "structs": ghidra_structs,
+    }
+    return data
+
+
+def struds_from_data(
+    data: Dict[str, Union[str, bool, List[Dict[str, Union[str, int]]]]]
+) -> Tuple[Dict[str, Type[AbStrud]], bool, str]:
+    """
+    Deserialize the Struds from a json
+    :return: Tuple of: all loaded struds, if big endian, the name
+    """
+    is_big_endian = data["big_endian"]
     all_struds = {}
     # x.length
     # This is too slow (3 seconds vs 37ms), let's parse it instead.
     # return b.remote_eval("{x.getName(): (x, x.length, [(c.fieldName, c.offset, c.endOffset,
     # c.isFlexibleArrayComponent()) for c in x.components])
     # for x in currentProgram.getDataTypeManager().getAllStructures()}")
-    for x in b.remote_eval(
-        "[(x.getName(), x.getLength(), x.toString())"
-        "for x in currentProgram.getDataTypeManager().getAllStructures()]"
-    ):
-        all_struds[x[0]] = ghidra_struct_to_strud(
-            is_big_endian, x[0], x[1], x[2], all_struds
+    ghidra_structs: List[Dict[str, Union[str, int]]] = data["structs"]
+    for x in ghidra_structs:
+        all_struds[x["name"]] = ghidra_struct_to_strud(
+            is_big_endian, x["name"], x["length"], x["ghidra"], all_struds
         )
-    return all_struds
+    return all_struds, data["big_endian"], data["name"]
 
 
 def gh_bridge(
@@ -730,22 +780,45 @@ class Strudra:
     Struda, craft byte structs from your ghidra db in python.
     """
 
-    def __init__(self, bridge: ghidra_bridge.GhidraBridge = None):
+    def __init__(
+        self,
+        bridge: ghidra_bridge.GhidraBridge = None,
+        filename="struds.json",
+        force_file_load=False,
+    ):
         f"""
         Create a new Strudra instance
         {__doc__}
 
         :param bridge: (optional) the ghidra bridge, else connects to localhost
+        :param filename: (optional) The filename to store ghidra structs too, locally. Defaults to struds.json.
+        :param force_file_load: (optional) If true, will not try to connect to ghidra, but load from file, initially.
         """
         self.bridge: ghidra_bridge.GhidraBridge = bridge if bridge else gh_bridge()
-        self.is_big_endian: bool = target_is_big_endian(self.bridge)
+        self.filename = filename
+        self.force_file_load = force_file_load
+
+        self._name: str = "<unloaded>"
+        self.struds: Dict[str, AbStrud] = {}
+
+        # we will load this later in reload, if force_file_load = True
+        self.is_big_endian: bool = False
+
+        if not self.force_file_load:
+            try:
+                self.is_big_endian: bool = target_is_big_endian(self.bridge)
+            except ConnectionRefusedError as ex:
+                print("Could not connect to Ghidra, loading from", filename)
+                self.force_file_load = True
+
+        # Get a copy of the initial class dict, so we can reset on `reload`
+
         dict_orig = self.__dict__.copy()
         # Make sure it's still there after the first reload...
         dict_orig["_dict_orig"] = dict_orig
         self._dict_orig: Dict[str, Any] = dict_orig
         self._dict_orig["_dict_orig"] = self._dict_orig
 
-        self.struds: Dict[str, Type[AbStrud]] = {}
         self.reload()
 
     def __dir__(self) -> List[str]:
@@ -754,12 +827,24 @@ class Strudra:
     def __getitem__(self, item) -> Any:
         return self.struds.__getitem__(item)
 
-    def reload(self) -> None:
+    def reload(self, force_ghidra=False) -> None:
         """
         Reload the structs from ghidra
+        :param force_ghidra: Overwrite force_file_load locally
         """
-        self.__dict__ = self._dict_orig
-        self.struds = load_struds(self.bridge)
+        self.__dict__ = self._dict_orig.copy()
+
+        if self.force_file_load and not force_ghidra:
+            data = data_from_file(self.filename)
+        else:
+            data = data_from_ghidra(self.bridge)
+            serialize_struds(data, filename=self.filename)
+
+        struds, is_big_endian, name = struds_from_data(data)
+        self._name = name
+        self.is_big_endian: bool = is_big_endian
+        self.struds = struds
+
         for name, strud in self.struds.items():
             if name not in self.__dict__:
                 # Make struds easily accessible
@@ -772,7 +857,7 @@ class Strudra:
         :return: The new Strud
         """
         ret = add_struct(self.bridge, cstruct)
-        self.reload()
+        self.reload(force_ghidra=True)
         return ret
 
     def parse_struct(self, cstruct: str) -> Type[AbStrud]:

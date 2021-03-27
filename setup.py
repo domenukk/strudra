@@ -9,7 +9,7 @@ with open("requirements.txt", "r") as f:
 
 setuptools.setup(
     name="strudra",
-    version="0.1.0",
+    version="0.1.1",
     author="domenukk",
     author_email="mail@dmnk.co",
     description="Craft Ghidra structs in python",

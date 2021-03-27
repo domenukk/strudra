@@ -240,8 +240,9 @@ class AbStrud:
         # str_repr: The string representation of a struct, from Ghidra
         # The (parsed) members of this Strud
         # The length of this Strud
-        if nested_at and not len(nested_at) == 2:
-            raise ValueError("Nested_at needs to be a tuple of (Strud, offset)")
+        if nested_at and not len(nested_at) == 2 or nested_at[1] > len(nested_at[0]):
+            raise ValueError("Nested_at needs to be a tuple of (Parent Strud, offset)")
+        # nested_at[0] = parent, nested_at[1] = offset
 
         self.str_repr: str = kwargs.pop("_str_repr")
         if not self.str_repr:
@@ -378,16 +379,16 @@ class AbStrud:
 
     def to_cstruct_str(self) -> str:
         """
-        Create a best-effort cstruct
+        Create a best-effort cstruct string from the current Strud object
         :return: a c struct
         """
         cstruct = f"struct {self.__class__.__name__} {{\n"
         for member in self.members:
             if member.is_array:
                 actual_type = member.typename.split("[")
-                cstruct += f"{actual_type} {member.name}[{member.el_count}];\n"
+                cstruct += f"\n{actual_type} {member.name}[{member.el_count}];\n"
             else:
-                cstruct += f"{member.typename} {member.name};"
+                cstruct += f"\n{member.typename} {member.name};"
 
         cstruct += "\n};"
         return cstruct
@@ -636,7 +637,8 @@ def define_struct(
             from_bytes,
             nested_at,
             _str_repr=str_repr,
-            _members=members,
+            # make a copy of the members, so we can alter them for dynamic strucs
+            _members=members.copy(),
             _length=length,
             _all_struds=all_struds,
             **kwargs,
@@ -783,8 +785,8 @@ class Strudra:
     def __init__(
         self,
         bridge: ghidra_bridge.GhidraBridge = None,
-        filename="struds.json",
-        force_file_load=False,
+        filename: Optional[str] = "struds.json",
+        force_from_file: bool = False,
     ):
         f"""
         Create a new Strudra instance
@@ -792,11 +794,11 @@ class Strudra:
 
         :param bridge: (optional) the ghidra bridge, else connects to localhost
         :param filename: (optional) The filename to store ghidra structs too, locally. Defaults to struds.json.
-        :param force_file_load: (optional) If true, will not try to connect to ghidra, but load from file, initially.
+        :param force_from_file: (optional) If true, will not try to connect to ghidra, but load from file, initially.
         """
         self.bridge: ghidra_bridge.GhidraBridge = bridge if bridge else gh_bridge()
         self.filename = filename
-        self.force_file_load = force_file_load
+        self.force_file_load = force_from_file
 
         self._name: str = "<unloaded>"
         self.struds: Dict[str, AbStrud] = {}
@@ -804,11 +806,18 @@ class Strudra:
         # we will load this later in reload, if force_file_load = True
         self.is_big_endian: bool = False
 
-        if not self.force_file_load:
+        if self.force_file_load:
+            if not filename:
+                raise ValueError("No filename given, but forcing file load.")
+        else:
             try:
                 self.is_big_endian: bool = target_is_big_endian(self.bridge)
             except ConnectionRefusedError as ex:
-                print("Could not connect to Ghidra, loading from", filename)
+                if not filename:
+                    raise ValueError(
+                        f"Could not connect to Ghidra, and no filename to load Struds from ({ex})"
+                    )
+                print(f"Could not connect to Ghidra {ex}, loading from {filename}")
                 self.force_file_load = True
 
         # Get a copy of the initial class dict, so we can reset on `reload`
@@ -838,7 +847,8 @@ class Strudra:
             data = data_from_file(self.filename)
         else:
             data = data_from_ghidra(self.bridge)
-            serialize_struds(data, filename=self.filename)
+            if self.filename:
+                serialize_struds(data, filename=self.filename)
 
         struds, is_big_endian, name = struds_from_data(data)
         self._name = name

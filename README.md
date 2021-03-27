@@ -2,6 +2,9 @@
 
 Welcome to Strudra, a way to craft Ghidra structs in python, using `ghidra_bridge`.
 
+It's quite convenient together with IPython, featuring tab completion, etc.
+Also, it can import, and somewhat export (try `.to_cstruct_str()`) c structs from and to Ghidra.
+
 ## How Studra Works
 
 Strudra loads all structs from the Ghidra 

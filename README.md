@@ -7,10 +7,10 @@ Also, it can import, and somewhat export (try `.to_cstruct_str()`) c structs fro
 
 ## How Studra Works
 
-Strudra loads all structs from the Ghidra 
+Strudra loads all structs from Ghidra. 
 For this to work, you have to setup `ghidra_bridge` in Ghidra: https://github.com/justfoxing/ghidra_bridge/
 
-Then, you can create instances of these structs, set values in these structs, and edit them.
+Then, you can create instances of these structs, set values in these structs, and serialize them.
 Good if you want to interact with your target.
 
 
